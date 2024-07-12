@@ -1,6 +1,7 @@
 import logging
 import math
-from typing import List, Tuple
+import os
+from typing import List, Tuple, Dict
 
 import numpy as np
 import pandas as pd
@@ -33,29 +34,45 @@ def parse_pdb_file(pdb_file_path: str) -> None:
         seq = pp.get_sequence().__str__()
         logger.info(f"Last sequence as string: {seq}")
 
-def download_pdb_files(file_path: str) -> None:
+def download_pdb_files(pdb_ids: List[str], output_dir: str = "pdb_files") -> Dict[str, str]:
     """
-    Download PDB files based on PDB IDs from a CSV file.
+    Download PDB files for given PDB IDs.
 
     Args:
-        file_path (str): Path to the CSV file containing PDB IDs.
-    """
-    logger.info(f"Reading CSV file: {file_path}")
-    df = pd.read_csv(file_path)
-    pdb_ids = df['PDBID'].dropna().unique().tolist()
+        pdb_ids (List[str]): List of PDB IDs to download.
+        output_dir (str): Directory to save PDB files.
 
+    Returns:
+        Dict[str, str]: Dictionary mapping PDB IDs to their file paths.
+    """
+    logger.info(f"Downloading PDB files for {len(pdb_ids)} structures")
+    
+    if not os.path.exists(output_dir):
+        os.makedirs(output_dir)
+    
+    pdb_file_paths = {}
     for pdb_id in pdb_ids:
+        file_path = os.path.join(output_dir, f"{pdb_id}.pdb")
+        if os.path.exists(file_path):
+            logger.info(f"PDB file for {pdb_id} already exists, skipping download")
+            pdb_file_paths[pdb_id] = file_path
+            continue
+        
         try:
             logger.info(f"Downloading PDB file: {pdb_id}")
             pdb_file = get_pdb_file(pdb_id, filetype="pdb", compression=False)
             if pdb_file:
-                with open(f"{pdb_id}.pdb", "w") as f:
+                with open(file_path, "w") as f:
                     f.write(pdb_file)
                 logger.info(f"Successfully downloaded {pdb_id}")
+                pdb_file_paths[pdb_id] = file_path
             else:
                 logger.warning(f"Failed to download {pdb_id}")
         except Exception as e:
             logger.error(f"Error downloading {pdb_id}: {e}")
+    
+    logger.info(f"Downloaded {len(pdb_file_paths)} PDB files")
+    return pdb_file_paths
 
 def calculate_dihedrals(file_path: str, target_residue_name: str, target_residue_number: int) -> List[List[float]]:
     """
@@ -119,25 +136,89 @@ def process_dihedral_data(dihedral_features: List[List[float]]) -> Tuple[pd.Data
     
     return dihedral_features_df, angle_df
 
+def extract_kcat_values(file_path: str) -> Dict[str, float]:
+    """
+    Extract kcat values from the CSV file.
+
+    Args:
+        file_path (str): Path to the CSV file.
+
+    Returns:
+        Dict[str, float]: Dictionary mapping PDB IDs to kcat values.
+    """
+    logger.info(f"Extracting kcat values from {file_path}")
+    df = pd.read_csv(file_path)
+    kcat_dict = dict(zip(df['PDBID'], df['kcat']))
+    logger.info(f"Extracted {len(kcat_dict)} kcat values")
+    return kcat_dict
+
+def analyze_structure_kcat(pdb_id: str, pdb_file_path: str, kcat: float, target_residue_name: str, target_residue_number: int) -> Dict:
+    """
+    Analyze a single PDB structure and its kcat value.
+
+    Args:
+        pdb_id (str): PDB ID of the structure.
+        pdb_file_path (str): Path to the PDB file.
+        kcat (float): kcat value for the enzyme.
+        target_residue_name (str): Name of the target residue.
+        target_residue_number (int): Number of the target residue.
+
+    Returns:
+        Dict: Analysis results including PDB ID, kcat, and dihedral angles.
+    """
+    dihedral_features = calculate_dihedrals(pdb_file_path, target_residue_name, target_residue_number)
+    
+    if not dihedral_features:
+        logger.warning(f"No dihedral features found for {pdb_id}")
+        return None
+
+    dihedral_features_df, angle_df = process_dihedral_data(dihedral_features)
+    
+    result = {
+        'PDB_ID': pdb_id,
+        'kcat': kcat,
+        'Phi': angle_df['Phi'].iloc[0],
+        'Psi': angle_df['Psi'].iloc[0],
+        'cos_phi': dihedral_features_df['cos_phi'].iloc[0],
+        'cos_psi': dihedral_features_df['cos_psi'].iloc[0],
+        'sin_phi': dihedral_features_df['sin_phi'].iloc[0],
+        'sin_psi': dihedral_features_df['sin_psi'].iloc[0]
+    }
+    
+    return result
+
 def main():
-    # Example usage
-    pdb_file_path = '2jk2.pdb'
+    csv_file_path = 'kcat_km_str_clean_filtered.csv'
     target_residue_name = "LYS"
     target_residue_number = 13
+    output_dir = "pdb_files"
 
-    # Parse PDB file
-    parse_pdb_file(pdb_file_path)
+    # Extract kcat values
+    kcat_dict = extract_kcat_values(csv_file_path)
 
-    # Calculate dihedral angles
-    dihedral_features = calculate_dihedrals(pdb_file_path, target_residue_name, target_residue_number)
+    # Download PDB files
+    pdb_file_paths = download_pdb_files(list(kcat_dict.keys()), output_dir)
 
-    # Process dihedral data
-    dihedral_features_df, angle_df = process_dihedral_data(dihedral_features)
+    # Analyze structures and kcat values
+    results = []
+    for pdb_id, kcat in kcat_dict.items():
+        if pdb_id in pdb_file_paths:
+            result = analyze_structure_kcat(pdb_id, pdb_file_paths[pdb_id], kcat, target_residue_name, target_residue_number)
+            if result:
+                results.append(result)
+        else:
+            logger.warning(f"PDB file for {pdb_id} not found, skipping analysis")
 
-    logger.info("Dihedral features:")
-    logger.info(dihedral_features_df.head())
-    logger.info("Angle data:")
-    logger.info(angle_df.head())
+    # Create a DataFrame with the results
+    results_df = pd.DataFrame(results)
+    
+    logger.info("Analysis results:")
+    logger.info(results_df.head())
+
+    # Save results to CSV
+    output_file = 'structure_kcat_analysis.csv'
+    results_df.to_csv(output_file, index=False)
+    logger.info(f"Results saved to {output_file}")
 
 if __name__ == "__main__":
     main()
